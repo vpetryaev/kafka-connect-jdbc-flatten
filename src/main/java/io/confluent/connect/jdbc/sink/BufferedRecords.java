@@ -84,42 +84,52 @@ public class BufferedRecords {
     final List<SinkRecord> flushed = new ArrayList<>();
 
     boolean schemaChanged = false;
-    if (!Objects.equals(keySchema, record.keySchema())) {
-      keySchema = record.keySchema();
-      schemaChanged = true;
-    }
-    //Tombstone record
-    if (isNull(record.valueSchema())) {
-      // For deletes, value and optionally value schema come in as null.
-      // We don't want to treat this as a schema change if key schemas is the same
-      // otherwise we flush unnecessarily.
-      if (config.deleteEnabled) {
-        if (config.flatten && config.insertMode == UPSERT && keys.contains(record.key())) {
-          // flush so a tombstone after a delete of same record isn't lost
+
+    if (!config.flatten) {
+      if (!Objects.equals(keySchema, record.keySchema())) {
+        keySchema = record.keySchema();
+        schemaChanged = true;
+      }
+      
+      //Tombstone record
+      if (isNull(record.valueSchema())) {
+        // For deletes, value and optionally value schema come in as null.
+        // We don't want to treat this as a schema change if key schemas is the same
+        // otherwise we flush unnecessarily.
+        if (config.deleteEnabled) {
+          if (config.flatten && config.insertMode == UPSERT && keys.contains(record.key())) {
+            // flush so a tombstone after a delete of same record isn't lost
+            log.debug("Forced flush on null valueSchema {}", record);
+            flushed.addAll(flush());
+          }
+          deletesInBatch = true;
+        }
+      }
+      //Same value schema as for previous record
+      else if (Objects.equals(valueSchema, record.valueSchema())) {
+        //Tombstone record
+        if ((deletesInBatch && config.deleteEnabled) ||
+                (record.value() == null && config.flatten && config.insertMode == UPSERT && keys.contains(record.key()))) {
+          // flush so an insert after a delete of same record isn't lost
+          log.debug("Forced flush on not equal valueSchema: {} record: {}", valueSchema, record);
           flushed.addAll(flush());
         }
-        deletesInBatch = true;
+      }
+      //Different value schema as for previous record
+      else {
+        // value schema is not null and has changed. This is a real schema change.
+        valueSchema = record.valueSchema();
+        schemaChanged = true;
       }
     }
-    //Same value schema as for previous record
-    else if (Objects.equals(valueSchema, record.valueSchema())) {
-      //Tombstone record
-      if ((deletesInBatch && config.deleteEnabled) ||
-              (record.value() == null && config.flatten && config.insertMode == UPSERT && keys.contains(record.key()))) {
-        // flush so an insert after a delete of same record isn't lost
-        flushed.addAll(flush());
-      }
-    }
-    //Different value schema as for previous record
-    else {
-      // value schema is not null and has changed. This is a real schema change.
-      valueSchema = record.valueSchema();
-      schemaChanged = true;
-    }
-    if (schemaChanged /*|| updateStatementBinder == null*/) {
+
+    if (!config.flatten && schemaChanged /*|| updateStatementBinder == null*/) {
       // Each batch needs to have the same schemas, so get the buffered records out
       flushed.addAll(flush());
-      // re-initialize everything that depends on the record schema
+    }
+
+    // re-initialize everything that depends on the record schema
+    if ((config.flatten && records.size()==0) || schemaChanged) {
       final SchemaPair schemaPair = new SchemaPair(
           record.keySchema(),
           record.valueSchema()
@@ -202,8 +212,7 @@ public class BufferedRecords {
         keys.add(record.key());
       }
     }
-
-    if (records.size() >= config.batchSize) {
+    if (!config.flatten && records.size() >= config.batchSize) {
       flushed.addAll(flush());
     }
     return flushed;
@@ -222,7 +231,7 @@ public class BufferedRecords {
         updateStatementBinder.bindRecord(record);
       }
     }
-    Optional<Long> totalUpdateCount = executeUpdates();
+    Optional<Long> totalUpdateCount = executeUpdates(true);
     long totalDeleteCount = executeDeletes();
 
     final long expectedCount = updateRecordCount();
@@ -255,13 +264,75 @@ public class BufferedRecords {
     return flushedRecords;
   }
 
+  public List<SinkRecord> flush(boolean OnlyDeletes) throws SQLException {
+    long totalDeleteCount = 0;
+    Optional<Long> totalUpdateCount = Optional.empty();
+    if (records.isEmpty()) {
+      log.debug("Records is empty");
+      return new ArrayList<>();
+    }
+    log.debug("Flushing {} buffered records with OnlyDeletes mode {} for table {}", records.size(), OnlyDeletes, tableId.tableName());
+
+    if ( OnlyDeletes && nonNull(deleteStatementBinder) ) {
+      for (Map.Entry<Object, List<SinkRecord>> mappedRecords :
+            records.stream().filter(v -> isNull(v.value())).collect(Collectors.groupingBy(r -> r.key())).entrySet()) {
+              deleteStatementBinder.bindRecord(mappedRecords.getValue().get(0));
+      }
+    }
+
+    if ( !OnlyDeletes) {
+      for (SinkRecord record : records.stream().filter(v -> nonNull(v.value())).collect(Collectors.toList()) ) {
+        updateStatementBinder.bindRecord(record);
+        log.debug("Binded record {} to updateStatementBinder {}", record, updateStatementBinder);
+      }
+    }
+
+    if ( OnlyDeletes ) {
+      deletesInBatch = true;
+      totalDeleteCount = executeDeletes();
+      deletesInBatch = false;
+      upsertDeletesInBatch = false;
+    } else {
+      totalUpdateCount = executeUpdates(false);
+      updatesInBatch = false;
+    }
+
+    final long expectedCount = updateRecordCount();
+    log.trace("{} records:{} resulting in totalUpdateCount:{} totalDeleteCount:{}",
+        config.insertMode, records.size(), totalUpdateCount, totalDeleteCount
+    );
+    if (!OnlyDeletes && totalUpdateCount.filter(total -> total != expectedCount).isPresent()
+        && config.insertMode == INSERT) {
+      throw new ConnectException(String.format(
+          "Update count (%d) did not sum up to total number of records inserted (%d)",
+          totalUpdateCount.get(),
+          expectedCount
+      ));
+    }
+    if (!OnlyDeletes && !totalUpdateCount.isPresent()) {
+      log.info(
+          "{} records:{} for table {}, but no count of the number of rows it affected is available",
+          config.insertMode,
+          records.size(),
+          tableId.tableName()
+      );
+    }
+
+    final List<SinkRecord> flushedRecords = records;
+    if ( !OnlyDeletes ) {
+      records = new ArrayList<>();
+      keys.clear();
+    }
+    return flushedRecords;
+  }
+
   /**
    * @return an optional count of all updated rows or an empty optional if no info is available
    */
-  private Optional<Long> executeUpdates() throws SQLException {
+  private Optional<Long> executeUpdates(boolean IncludeDeletes) throws SQLException {
     Optional<Long> count = Optional.empty();
     try {
-      if (config.flatten && config.insertMode == UPSERT) {
+      if (IncludeDeletes && config.flatten && config.insertMode == UPSERT) {
         if (upsertDeletesInBatch || deletesInBatch) {
           deletesInBatch = true;
           executeDeletes();

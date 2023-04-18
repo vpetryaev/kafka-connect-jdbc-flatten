@@ -162,18 +162,18 @@ public class JdbcDbWriter {
                     if (tableIdList.isEmpty()) {throw new ConnectException("Received null value for record key " + fr.key()
                             + " but this table schema has not yet been cached neither could it be found in Database Metadata");}
                       //If tableIdList is not empty, there exists a buffer and/or matching tables exist in the target db
-                      tableIdList.forEach(ctid -> {
-                        //For each mathing tableId found
-                        //Create a buffer for each mathing table
+                    tableIdList.forEach(ctid -> {
+                      //For each mathing tableId found
+                      //Create a buffer for each mathing table
                       BufferedRecords buffer = new BufferedRecords(config, destinationTable(ctid.getValue1().tableName()), dbDialect, dbStructure, connection);
-                        try {
-                          //Add the null value to each buffer to assure delete from all flattened tables
-                          buffer.add(fr);
-                        } catch (SQLException e) {
-                          e.printStackTrace();
+                      try {
+                        //Add the null value to each buffer to assure delete from all flattened tables
+                        buffer.add(fr);
+                      } catch (SQLException e) {
+                        e.printStackTrace();
                           throw new RuntimeException(e);
-                        }
-                        bufferByTable.put(destinationTable(ctid.getValue0()), buffer);
+                      }
+                      bufferByTable.put(destinationTable(ctid.getValue0()), buffer);
                     });
                   }
                   //A null value was received for a but there are already matching buffers in place
@@ -202,6 +202,31 @@ public class JdbcDbWriter {
           e.printStackTrace();
           throw new ConnectException(e.getCause());
         }
+
+        for (Map.Entry<TableId, BufferedRecords> entry :
+              bufferByTable.entrySet().stream().sorted(
+                ((entry1, entry2) ->
+                  Integer.compare(entry2.getKey().toString().length(), entry1.getKey().toString().length())
+                )
+              ).collect(Collectors.toList())
+            ) {
+          log.debug("Deleting records in JDBC Writer for table ID: {}", entry.getKey().toString());
+          entry.getValue().flush(true);
+        }
+
+        for (Map.Entry<TableId, BufferedRecords> entry :
+              bufferByTable.entrySet().stream().sorted(
+                ((entry1, entry2) ->
+                  Integer.compare(entry1.getKey().toString().length(), entry2.getKey().toString().length())
+                )
+              ).collect(Collectors.toList())
+            ) {
+          BufferedRecords buffer = entry.getValue();
+          log.debug("Inserting records in JDBC Writer for table ID: {}", entry.getKey().toString());
+          buffer.flush(false);
+          buffer.close();
+        }
+
       }
       //Else, flatten is not enabled record gets processed without flattening
       else {
@@ -214,12 +239,14 @@ public class JdbcDbWriter {
         buffer.add(record);
       }
     }
-    for (Map.Entry<TableId, BufferedRecords> entry : bufferByTable.entrySet()) {
-      TableId tableId = entry.getKey();
-      BufferedRecords buffer = entry.getValue();
-      log.debug("Flushing records in JDBC Writer for table ID: {}", tableId);
-      buffer.flush();
-      buffer.close();
+
+    if (!config.flatten) {
+      for (Map.Entry<TableId, BufferedRecords> entry : bufferByTable.entrySet()) {
+        BufferedRecords buffer = entry.getValue();
+        log.debug("Updating records in JDBC Writer for table ID: {}", entry.getKey().toString());
+        buffer.flush(false);
+        buffer.close();
+      }
     }
     connection.commit();
   }
